@@ -2,8 +2,9 @@
 pragma solidity ^0.8.24;
 
 import {IERC20} from "openzeppelin-contracts/contracts/token/ERC20/IERC20.sol";
+import {ERC721} from "openzeppelin-contracts/contracts/token/ERC721/ERC721.sol";
 
-contract Pool {
+contract Pool is ERC721 {
     address public immutable token0;
     address public immutable token1;
     uint24 public immutable fee;
@@ -17,12 +18,12 @@ contract Pool {
     uint256 public unclaimedFee1;
 
     uint256 public totalShares;
-    mapping(address => uint256) public sharesOf;
-
+    mapping(uint256 => uint256) public sharesOfToken;
     uint256 public feePerShare0;
     uint256 public feePerShare1;
-    mapping(address => uint256) public feeDebt0;
-    mapping(address => uint256) public feeDebt1;
+    mapping(uint256 => uint256) public feeDebt0Token;
+    mapping(uint256 => uint256) public feeDebt1Token;
+    uint256 public nextTokenId;
 
     bool private locked;
 
@@ -38,7 +39,7 @@ contract Pool {
         uint256 _price,
         uint256 _priceLower,
         uint256 _priceUpper
-    ) {
+    ) ERC721("MetaNode LP", "MNLP") {
         require(_token0 != _token1, "IDENTICAL");
         require(_token0 != address(0) && _token1 != address(0), "ZERO");
         require(_priceLower <= _price && _price <= _priceUpper, "PRICE_RANGE");
@@ -69,28 +70,47 @@ contract Pool {
         return (a + b - 1) / b;
     }
 
+    function currentPrice() public view returns (uint256) {
+        if (reserve0 == 0 || reserve1 == 0) {
+            return price;
+        }
+        return (reserve1 * 1e18) / reserve0;
+    }
+
+    function _isApprovedOrOwner(address spender, uint256 tokenId) internal view returns (bool) {
+        address owner = ownerOf(tokenId);
+        return (spender == owner || getApproved(tokenId) == spender || isApprovedForAll(owner, spender));
+    }
+
     function quoteExactIn(address tokenIn, uint256 amountIn) external view returns (uint256 amountOut, uint256 feeAmount) {
-        require(priceLower <= price && price <= priceUpper, "OUT_OF_RANGE");
         require(totalShares > 0, "NO_LIQUIDITY");
         feeAmount = (amountIn * fee) / 1_000_000;
         uint256 netIn = amountIn - feeAmount;
+        uint256 R0 = reserve0;
+        uint256 R1 = reserve1;
         if (tokenIn == token0) {
-            amountOut = (netIn * price) / 1e18;
+            uint256 k = R0 * R1;
+            amountOut = R1 - (k / (R0 + netIn));
         } else if (tokenIn == token1) {
-            amountOut = (netIn * 1e18) / price;
+            uint256 k = R0 * R1;
+            amountOut = R0 - (k / (R1 + netIn));
         } else {
             revert("TOKEN");
         }
     }
 
     function quoteExactOut(address tokenIn, uint256 amountOut) external view returns (uint256 amountInGross, uint256 feeAmount) {
-        require(priceLower <= price && price <= priceUpper, "OUT_OF_RANGE");
         require(totalShares > 0, "NO_LIQUIDITY");
+        uint256 R0 = reserve0;
+        uint256 R1 = reserve1;
+        uint256 outActual = amountOut;
         uint256 netIn;
         if (tokenIn == token0) {
-            netIn = _divUp(amountOut * 1e18, price);
+            if (outActual >= R1) outActual = R1 - 1;
+            netIn = _divUp(R0 * outActual, R1 - outActual);
         } else if (tokenIn == token1) {
-            netIn = _divUp(amountOut * price, 1e18);
+            if (outActual >= R0) outActual = R0 - 1;
+            netIn = _divUp(R1 * outActual, R0 - outActual);
         } else {
             revert("TOKEN");
         }
@@ -98,7 +118,7 @@ contract Pool {
         feeAmount = amountInGross - netIn;
     }
 
-    function mintLiquidity(address to) external nonReentrant returns (uint256 sharesMinted, uint256 added0, uint256 added1) {
+    function mintLiquidity(address to) external nonReentrant returns (uint256 tokenId, uint256 sharesMinted, uint256 added0, uint256 added1) {
         uint256 bal0 = _balance0();
         uint256 bal1 = _balance1();
         added0 = bal0 - (reserve0 + unclaimedFee0);
@@ -112,49 +132,68 @@ contract Pool {
             sharesMinted = (addValue * totalShares) / totalValue;
         }
         require(sharesMinted > 0, "ZERO_SHARES");
-        sharesOf[to] += sharesMinted;
+        tokenId = ++nextTokenId;
+        _mint(to, tokenId);
+        sharesOfToken[tokenId] = sharesMinted;
+        feeDebt0Token[tokenId] = (sharesMinted * feePerShare0) / 1e18;
+        feeDebt1Token[tokenId] = (sharesMinted * feePerShare1) / 1e18;
         totalShares += sharesMinted;
         reserve0 += added0;
         reserve1 += added1;
         emit Mint(to, added0, added1, sharesMinted);
     }
 
-    function burnLiquidity(address from, uint256 sharesBurn, address to) external nonReentrant returns (uint256 amount0, uint256 amount1) {
-        require(sharesOf[from] >= sharesBurn && sharesBurn > 0, "SHARES");
+    function burnLiquidity(uint256 tokenId, uint256 sharesBurn, address to) external nonReentrant returns (uint256 amount0, uint256 amount1) {
+        require(_isApprovedOrOwner(msg.sender, tokenId), "NOT_OWNER");
+        uint256 sBefore = sharesOfToken[tokenId];
+        require(sBefore >= sharesBurn && sharesBurn > 0, "SHARES");
         amount0 = (reserve0 * sharesBurn) / totalShares;
         amount1 = (reserve1 * sharesBurn) / totalShares;
-        sharesOf[from] -= sharesBurn;
+        uint256 sAfter = sBefore - sharesBurn;
+        sharesOfToken[tokenId] = sAfter;
+        uint256 d0 = feeDebt0Token[tokenId];
+        uint256 d1 = feeDebt1Token[tokenId];
         totalShares -= sharesBurn;
+        if (sAfter == 0) {
+            delete feeDebt0Token[tokenId];
+            delete feeDebt1Token[tokenId];
+            _burn(tokenId);
+        } else {
+            feeDebt0Token[tokenId] = (d0 * sAfter) / sBefore;
+            feeDebt1Token[tokenId] = (d1 * sAfter) / sBefore;
+        }
         reserve0 -= amount0;
         reserve1 -= amount1;
         require(IERC20(token0).transfer(to, amount0), "T0");
         require(IERC20(token1).transfer(to, amount1), "T1");
-        emit Burn(from, sharesBurn, amount0, amount1);
+        emit Burn(ownerOf(tokenId), sharesBurn, amount0, amount1);
     }
 
-    function collectFees(address provider, address to) external nonReentrant returns (uint256 amount0, uint256 amount1) {
-        uint256 s = sharesOf[provider];
+    function collectFees(uint256 tokenId, address to) external nonReentrant returns (uint256 amount0, uint256 amount1) {
+        require(_isApprovedOrOwner(msg.sender, tokenId), "NOT_OWNER");
+        uint256 s = sharesOfToken[tokenId];
         uint256 accrued0 = (s * feePerShare0) / 1e18;
         uint256 accrued1 = (s * feePerShare1) / 1e18;
-        amount0 = accrued0 - feeDebt0[provider];
-        amount1 = accrued1 - feeDebt1[provider];
-        if (amount0 > 0) {
-            feeDebt0[provider] += amount0;
+        uint256 d0 = feeDebt0Token[tokenId];
+        uint256 d1 = feeDebt1Token[tokenId];
+        if (accrued0 > d0) {
+            amount0 = accrued0 - d0;
+            feeDebt0Token[tokenId] = accrued0;
             require(unclaimedFee0 >= amount0, "FEE0");
             unclaimedFee0 -= amount0;
             require(IERC20(token0).transfer(to, amount0), "F0");
         }
-        if (amount1 > 0) {
-            feeDebt1[provider] += amount1;
+        if (accrued1 > d1) {
+            amount1 = accrued1 - d1;
+            feeDebt1Token[tokenId] = accrued1;
             require(unclaimedFee1 >= amount1, "FEE1");
             unclaimedFee1 -= amount1;
             require(IERC20(token1).transfer(to, amount1), "F1");
         }
-        emit Collect(provider, amount0, amount1);
+        emit Collect(ownerOf(tokenId), amount0, amount1);
     }
 
     function swapExactIn(address tokenIn, uint256 amountIn, uint256 minOut, address to) external nonReentrant returns (uint256 amountOut, uint256 amountInUsed) {
-        require(priceLower <= price && price <= priceUpper, "OUT_OF_RANGE");
         require(tokenIn == token0 || tokenIn == token1, "TOKEN");
         require(totalShares > 0, "NO_LIQUIDITY");
         uint256 balIn = tokenIn == token0 ? _balance0() : _balance1();
@@ -164,41 +203,47 @@ contract Pool {
         uint256 feeAmount = (grossIn * fee) / 1_000_000;
         uint256 netIn = grossIn - feeAmount;
         if (tokenIn == token0) {
-            uint256 outByIn = (netIn * price) / 1e18;
-            uint256 maxOut = reserve1;
-            if (outByIn > maxOut) {
-                amountOut = maxOut;
-                uint256 netUsed = _divUp(amountOut * 1e18, price);
-                amountInUsed = _divUp(netUsed * 1_000_000, 1_000_000 - fee);
-                feeAmount = amountInUsed - netUsed;
-                require(amountInUsed <= grossIn, "AMOUNT_IN");
-                netIn = netUsed;
-            } else {
-                amountOut = outByIn;
-                amountInUsed = grossIn;
+            uint256 R0 = reserve0;
+            uint256 R1 = reserve1;
+            uint256 k = R0 * R1;
+            uint256 outByIn = R1 - (k / (R0 + netIn));
+            uint256 maxOut = R1;
+            if (outByIn > maxOut) outByIn = maxOut;
+            amountOut = outByIn;
+            uint256 netUsed = _divUp(R0 * amountOut, R1 - amountOut);
+            if (netUsed > netIn) netUsed = netIn;
+            amountInUsed = _divUp(netUsed * 1_000_000, 1_000_000 - fee);
+            require(amountInUsed <= grossIn, "AMOUNT_IN");
+            uint256 refund = grossIn - amountInUsed;
+            if (refund > 0) {
+                require(IERC20(token0).transfer(msg.sender, refund), "REFUND0");
             }
+            feeAmount = amountInUsed - netUsed;
             require(amountOut >= minOut, "SLIPPAGE");
-            reserve0 += netIn;
+            reserve0 += netUsed;
             unclaimedFee0 += feeAmount;
             reserve1 -= amountOut;
             feePerShare0 += (feeAmount * 1e18) / totalShares;
             require(IERC20(token1).transfer(to, amountOut), "OUT1");
         } else {
-            uint256 outByIn = (netIn * 1e18) / price;
-            uint256 maxOut = reserve0;
-            if (outByIn > maxOut) {
-                amountOut = maxOut;
-                uint256 netUsed = _divUp(amountOut * price, 1e18);
-                amountInUsed = _divUp(netUsed * 1_000_000, 1_000_000 - fee);
-                feeAmount = amountInUsed - netUsed;
-                require(amountInUsed <= grossIn, "AMOUNT_IN");
-                netIn = netUsed;
-            } else {
-                amountOut = outByIn;
-                amountInUsed = grossIn;
+            uint256 R0 = reserve0;
+            uint256 R1 = reserve1;
+            uint256 k = R0 * R1;
+            uint256 outByIn = R0 - (k / (R1 + netIn));
+            uint256 maxOut = R0;
+            if (outByIn > maxOut) outByIn = maxOut;
+            amountOut = outByIn;
+            uint256 netUsed = _divUp(R1 * amountOut, R0 - amountOut);
+            if (netUsed > netIn) netUsed = netIn;
+            amountInUsed = _divUp(netUsed * 1_000_000, 1_000_000 - fee);
+            require(amountInUsed <= grossIn, "AMOUNT_IN");
+            uint256 refund = grossIn - amountInUsed;
+            if (refund > 0) {
+                require(IERC20(token1).transfer(msg.sender, refund), "REFUND1");
             }
+            feeAmount = amountInUsed - netUsed;
             require(amountOut >= minOut, "SLIPPAGE");
-            reserve1 += netIn;
+            reserve1 += netUsed;
             unclaimedFee1 += feeAmount;
             reserve0 -= amountOut;
             feePerShare1 += (feeAmount * 1e18) / totalShares;
@@ -208,20 +253,17 @@ contract Pool {
     }
 
     function swapExactOut(address tokenIn, uint256 amountOut, uint256 maxIn, address to) external nonReentrant returns (uint256 amountInGross, uint256 amountOutActual) {
-        require(priceLower <= price && price <= priceUpper, "OUT_OF_RANGE");
         require(tokenIn == token0 || tokenIn == token1, "TOKEN");
         require(totalShares > 0, "NO_LIQUIDITY");
         if (tokenIn == token0) {
-            uint256 maxOut = reserve1;
+            uint256 R0 = reserve0;
+            uint256 R1 = reserve1;
             uint256 balIn = _balance0();
-            uint256 heldIn = reserve0 + unclaimedFee0;
+            uint256 heldIn = R0 + unclaimedFee0;
             uint256 grossDelta = balIn - heldIn;
-            uint256 netFromDelta = (grossDelta * (1_000_000 - fee)) / 1_000_000;
-            uint256 outByDelta = (netFromDelta * price) / 1e18;
-            amountOutActual = amountOut;
-            if (amountOutActual > outByDelta) amountOutActual = outByDelta;
-            if (amountOutActual > maxOut) amountOutActual = maxOut;
-            uint256 netNeeded = _divUp(amountOutActual * 1e18, price);
+            uint256 amountOutReq = amountOut;
+            if (amountOutReq >= R1) amountOutReq = R1 - 1;
+            uint256 netNeeded = _divUp(R0 * amountOutReq, R1 - amountOutReq);
             amountInGross = _divUp(netNeeded * 1_000_000, 1_000_000 - fee);
             require(amountInGross <= maxIn, "MAX_IN");
             require(amountInGross <= grossDelta, "INSUFFICIENT_IN");
@@ -232,20 +274,19 @@ contract Pool {
             uint256 feeAmount = amountInGross - netNeeded;
             reserve0 += netNeeded;
             unclaimedFee0 += feeAmount;
+            amountOutActual = amountOutReq;
             reserve1 -= amountOutActual;
             feePerShare0 += (feeAmount * 1e18) / totalShares;
             require(IERC20(token1).transfer(to, amountOutActual), "OUT1");
         } else {
-            uint256 maxOut = reserve0;
+            uint256 R0 = reserve0;
+            uint256 R1 = reserve1;
             uint256 balIn = _balance1();
-            uint256 heldIn = reserve1 + unclaimedFee1;
+            uint256 heldIn = R1 + unclaimedFee1;
             uint256 grossDelta = balIn - heldIn;
-            uint256 netFromDelta = (grossDelta * (1_000_000 - fee)) / 1_000_000;
-            uint256 outByDelta = (netFromDelta * 1e18) / price;
-            amountOutActual = amountOut;
-            if (amountOutActual > outByDelta) amountOutActual = outByDelta;
-            if (amountOutActual > maxOut) amountOutActual = maxOut;
-            uint256 netNeeded = _divUp(amountOutActual * price, 1e18);
+            uint256 amountOutReq = amountOut;
+            if (amountOutReq >= R0) amountOutReq = R0 - 1;
+            uint256 netNeeded = _divUp(R1 * amountOutReq, R0 - amountOutReq);
             amountInGross = _divUp(netNeeded * 1_000_000, 1_000_000 - fee);
             require(amountInGross <= maxIn, "MAX_IN");
             require(amountInGross <= grossDelta, "INSUFFICIENT_IN");
@@ -256,6 +297,7 @@ contract Pool {
             uint256 feeAmount = amountInGross - netNeeded;
             reserve1 += netNeeded;
             unclaimedFee1 += feeAmount;
+            amountOutActual = amountOutReq;
             reserve0 -= amountOutActual;
             feePerShare1 += (feeAmount * 1e18) / totalShares;
             require(IERC20(token0).transfer(to, amountOutActual), "OUT0");
